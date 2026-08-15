@@ -19,8 +19,8 @@ Run with:
 
 from __future__ import annotations
 
+import html
 import logging
-import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -45,11 +45,35 @@ st.set_page_config(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ─── Cached data access ────────────────────────────────────────────────────────
+@st.cache_data(ttl=config.CACHE_TTL, show_spinner=False)
+def fetch_trends(keywords: tuple[str, ...], timeframe: str, geo: str) -> dict:
+    """
+    Fetch everything for one query, memoised for ``config.CACHE_TTL`` seconds.
+
+    Google Trends rate-limits aggressively, and without this every rerun —
+    changing a dropdown, switching tabs, re-clicking Analyse — issued a fresh
+    round of requests and risked a 429. Keywords arrive as a tuple because
+    ``st.cache_data`` needs hashable arguments.
+    """
+    analyzer = TrendsAnalyzer()
+    return analyzer.fetch_all(list(keywords), timeframe=timeframe, geo=geo)
+
 # ─── Global CSS ────────────────────────────────────────────────────────────────
 st.markdown(
     """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+/* Text tokens. The previous greys (#555–#777) sat at 2.5–4.1:1 against the
+   dark background, below the WCAG AA 4.5:1 minimum for body text. These all
+   clear 6:1. Defined once so the shades can't drift apart again. */
+:root {
+    --gsa-text-1: #e6e8f0;   /* primary   */
+    --gsa-text-2: #9aa0b4;   /* secondary */
+    --gsa-text-3: #8d93a8;   /* tertiary  */
+}
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 
@@ -95,7 +119,7 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
 }
 .gsa-label {
     font-size: 0.73rem;
-    color: #777;
+    color: var(--gsa-text-2);
     text-transform: uppercase;
     letter-spacing: 0.09em;
     font-weight: 600;
@@ -109,13 +133,13 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
 }
 .gsa-sub {
     font-size: 0.8rem;
-    color: #666;
+    color: var(--gsa-text-3);
     margin-top: 0.1rem;
 }
 .gsa-delta        { font-size: 0.88rem; font-weight: 600; margin-top: 0.35rem; }
 .gsa-delta.up     { color: #00d4aa; }
 .gsa-delta.down   { color: #ff6b6b; }
-.gsa-delta.neutral{ color: #aaa; }
+.gsa-delta.neutral{ color: var(--gsa-text-2); }
 
 /* ── Hero ── */
 .gsa-hero { text-align: center; padding: 2.2rem 1rem 1.4rem; }
@@ -129,7 +153,7 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
     margin: 0 0 0.5rem;
     line-height: 1.1;
 }
-.gsa-hero p { color: #777; font-size: 1rem; margin: 0; }
+.gsa-hero p { color: var(--gsa-text-2); font-size: 1rem; margin: 0; }
 
 /* ── Section headers ── */
 .gsa-section {
@@ -152,7 +176,7 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
 }
 .stTabs [data-baseweb="tab"] {
     border-radius: 10px;
-    color: #777;
+    color: var(--gsa-text-2);
     font-weight: 500;
     padding: 9px 22px;
     font-size: 0.9rem;
@@ -267,34 +291,47 @@ with st.sidebar:
     st.markdown("### 🔤 Keywords")
     keywords_raw = st.text_area(
         "keywords",
-        value="Artificial Intelligence\nMachine Learning\nDeep Learning",
+        value="\n".join(config.DEFAULT_KEYWORDS),
         height=130,
         label_visibility="collapsed",
-        placeholder="Enter up to 5 keywords, one per line",
+        placeholder=f"Enter up to {config.MAX_KEYWORDS} keywords, one per line",
     )
-    keywords: list[str] = [
-        k.strip() for k in keywords_raw.strip().splitlines() if k.strip()
-    ][: config.MAX_KEYWORDS]
+    entered = [k.strip() for k in keywords_raw.strip().splitlines() if k.strip()]
+    # Preserve order but drop duplicates — Google rejects repeated terms in a
+    # single payload.
+    keywords: list[str] = list(dict.fromkeys(entered))[: config.MAX_KEYWORDS]
 
-    if len([k for k in keywords_raw.strip().splitlines() if k.strip()]) > config.MAX_KEYWORDS:
+    if len(entered) > config.MAX_KEYWORDS:
         st.warning(f"Only the first {config.MAX_KEYWORDS} keywords will be used.")
 
     if keywords:
-        badges = " ".join(f'<span class="gsa-badge">{k}</span>' for k in keywords)
+        # Keywords are user input rendered into an unsafe_allow_html block, so
+        # they must be escaped or a term like "</div><img onerror=...>" would
+        # execute as markup.
+        badges = " ".join(
+            f'<span class="gsa-badge">{html.escape(k)}</span>' for k in keywords
+        )
         st.markdown(badges, unsafe_allow_html=True)
 
     st.markdown("---")
 
     # --- Timeframe ---
     st.markdown("### 📅 Timeframe")
+    _tf_labels = list(config.TIMEFRAME_OPTIONS)
+    _tf_default = next(
+        (i for i, lbl in enumerate(_tf_labels)
+         if config.TIMEFRAME_OPTIONS[lbl] == config.DEFAULT_TIMEFRAME),
+        0,
+    )
     tf_label: str = st.selectbox(
         "Timeframe",
-        options=list(config.TIMEFRAME_OPTIONS),
-        index=6,
+        options=_tf_labels,
+        index=_tf_default,
         label_visibility="collapsed",
     )
     timeframe: str = config.TIMEFRAME_OPTIONS[tf_label]
 
+    timeframe_valid = True
     use_custom = st.checkbox("Custom date range", value=False)
     if use_custom:
         c1, c2 = st.columns(2)
@@ -304,6 +341,10 @@ with st.sidebar:
             timeframe = f"{start_d} {end_d}"
             tf_label  = f"{start_d} → {end_d}"
         else:
+            # Previously this only showed an error while leaving `timeframe`
+            # on the preset, so clicking Analyse quietly ran a different
+            # query than the one on screen.
+            timeframe_valid = False
             st.error("Start must be before End.")
 
     st.markdown("---")
@@ -322,15 +363,33 @@ with st.sidebar:
 
     # --- Options ---
     st.markdown("### 🔧 Options")
-    smooth       = st.checkbox("Smooth trend lines", value=True)
-    forecast_n   = st.slider("Forecast periods (weeks)", 4, 52, 12, 4)
+    smooth = st.checkbox("Smooth trend lines", value=True)
+
+    # Google Trends changes resolution with the width of the window, so the
+    # horizon is not always in weeks: "Past 7 days" returns hourly data and
+    # "2004 – present" returns monthly. Label the slider in the unit the
+    # selected timeframe will actually return.
+    _freq, _unit_one, _unit_many = config.granularity_for(timeframe)
+    forecast_n = st.slider(
+        f"Forecast horizon ({_unit_many})",
+        config.FORECAST_MIN_PERIODS,
+        config.FORECAST_MAX_PERIODS,
+        config.FORECAST_PERIODS,
+        config.FORECAST_MIN_PERIODS,
+        help=f"'{tf_label}' returns data in {_unit_many}, "
+             f"so this forecasts that many {_unit_many} ahead.",
+    )
 
     st.markdown("---")
 
-    run_analysis = st.button("🚀 Analyse Trends", use_container_width=True)
+    run_analysis = st.button(
+        "🚀 Analyse Trends",
+        use_container_width=True,
+        disabled=not timeframe_valid,
+    )
 
     st.markdown(
-        '<div style="color:#444;font-size:0.72rem;text-align:center;margin-top:0.5rem;">'
+        '<div style="color:var(--gsa-text-3);font-size:0.72rem;text-align:center;margin-top:0.5rem;">'
         "Powered by Google Trends · pytrends · Streamlit"
         "</div>",
         unsafe_allow_html=True,
@@ -340,57 +399,52 @@ with st.sidebar:
 if run_analysis:
     if not keywords:
         st.error("Please enter at least one keyword.")
+    elif not timeframe_valid:
+        st.error("Fix the custom date range before running the analysis.")
     else:
         with st.spinner("🔄 Fetching data from Google Trends …"):
             try:
-                analyzer  = TrendsAnalyzer()
-                processor = DataProcessor()
+                # Pacing between requests lives inside TrendsAnalyzer; this
+                # call is cached, so repeat runs of the same query are free.
+                result = fetch_trends(tuple(keywords), timeframe, geo)
 
-                # Interest over time
-                analyzer.build_payload(keywords, timeframe=timeframe, geo=geo)
-                time.sleep(1)
-                iot_df = analyzer.get_interest_over_time()
+                iot_df = DataProcessor.clean_interest_over_time(result["iot_df"])
+
+                # Google silently drops keywords with too little volume, so
+                # the returned columns are the authoritative list.
+                returned = [k for k in keywords if k in iot_df.columns]
+                dropped  = [k for k in keywords if k not in iot_df.columns]
 
                 store: dict = {
-                    "keywords":  keywords,
-                    "tf_label":  tf_label,
-                    "geo_label": geo_label,
-                    "iot_df":    iot_df,
-                    "region_df": pd.DataFrame(),
-                    "related":   {},
-                    "suggestions": [],
+                    "keywords":    returned,
+                    "requested":   keywords,
+                    "dropped":     dropped,
+                    "tf_label":    tf_label,
+                    "geo_label":   geo_label,
+                    "freq":        _freq,
+                    "unit_one":    _unit_one,
+                    "unit_many":   _unit_many,
+                    "iot_df":      iot_df,
+                    "region_df":   result["region_df"],
+                    "related":     result["related"],
+                    "suggestions": result["suggestions"],
+                    "warnings":    result["warnings"],
                 }
 
-                # Interest by region
-                try:
-                    time.sleep(2)
-                    store["region_df"] = analyzer.get_interest_by_region()
-                except Exception as exc:
-                    st.warning(f"Regional data unavailable: {exc}")
-
-                # Related queries
-                try:
-                    time.sleep(2)
-                    store["related"] = analyzer.get_related_queries()
-                except Exception as exc:
-                    logger.warning("Related queries failed: %s", exc)
-
-                # Keyword suggestions (first 2 keywords only to avoid rate limits)
-                for kw in keywords[:2]:
-                    try:
-                        time.sleep(1)
-                        suggs = analyzer.get_suggestions(kw)
-                        if suggs:
-                            store["suggestions"].append({"keyword": kw, "suggestions": suggs})
-                    except Exception:
-                        pass
-
                 st.session_state.data          = store
-                st.session_state.keywords      = keywords
+                st.session_state.keywords      = returned
                 st.session_state.analysis_done = True
-                st.success("✅ Data loaded successfully!")
+
+                if returned:
+                    st.success("✅ Data loaded successfully!")
+                else:
+                    st.warning(
+                        "Google Trends returned no data for any of these keywords. "
+                        "Try broader terms or a longer timeframe."
+                    )
 
             except Exception as exc:
+                logger.exception("Analysis failed")
                 st.error(f"❌ Analysis failed: {exc}")
                 st.info(
                     "💡 Google Trends may be rate-limiting your IP. "
@@ -398,22 +452,40 @@ if run_analysis:
                 )
                 st.session_state.analysis_done = False
 
+# Surface non-fatal fetch problems and dropped keywords on every rerun, not
+# just the one that triggered the fetch.
+if st.session_state.analysis_done and st.session_state.data:
+    for _msg in st.session_state.data.get("warnings", []):
+        st.warning(_msg)
+    _dropped = st.session_state.data.get("dropped", [])
+    if _dropped:
+        st.info(
+            "No data returned for: "
+            + ", ".join(f"**{d}**" for d in _dropped)
+            + " — these are usually too low-volume for the selected "
+              "timeframe or region."
+        )
+
 # ─── Results display ──────────────────────────────────────────────────────────
 if st.session_state.analysis_done and st.session_state.data:
     store     = st.session_state.data
-    keywords  = st.session_state.keywords
     iot_df    = store.get("iot_df", pd.DataFrame())
     region_df = store.get("region_df", pd.DataFrame())
-    processor = DataProcessor()
+    unit_one  = store.get("unit_one", "period")
+
+    # Only ever iterate keywords Google actually returned a column for.
+    keywords = [k for k in st.session_state.keywords if k in iot_df.columns]
 
     # ── Summary metric cards ───────────────────────────────────────────────────
-    if not iot_df.empty:
+    if not iot_df.empty and keywords:
         st.markdown("### 📊 Snapshot")
+        # Size the column grid to the keywords that have data, so a dropped
+        # keyword no longer leaves an unexplained empty slot.
         cols = st.columns(len(keywords))
         for i, kw in enumerate(keywords):
-            if kw not in iot_df.columns:
+            stats = DataProcessor.compute_summary_stats(iot_df, kw)
+            if not stats:
                 continue
-            stats = processor.compute_summary_stats(iot_df, kw)
             trend = stats.get("trend", 0.0)
             dc    = "up" if trend > 0 else ("down" if trend < 0 else "neutral")
             sym   = "▲" if trend > 0 else ("▼" if trend < 0 else "→")
@@ -421,11 +493,11 @@ if st.session_state.analysis_done and st.session_state.data:
                 st.markdown(
                     f"""
 <div class="gsa-card">
-  <div class="gsa-label">{kw}</div>
+  <div class="gsa-label">{html.escape(kw)}</div>
   <div class="gsa-value">{stats.get('current','–')}</div>
   <div class="gsa-sub">Peak: <b>{stats.get('peak','–')}</b> on {stats.get('peak_date','–')}</div>
   <div class="gsa-sub">Avg: {stats.get('avg','–')}</div>
-  <div class="gsa-delta {dc}">{sym} {abs(trend):.2f}% avg weekly change</div>
+  <div class="gsa-delta {dc}">{sym} {abs(trend):.2f}% avg change per {unit_one}</div>
 </div>""",
                     unsafe_allow_html=True,
                 )
@@ -458,29 +530,44 @@ if st.session_state.analysis_done and st.session_state.data:
 
     # ── Tab 2 · Regional ─────────────────────────────────────────────────────
     with t2:
-        if not region_df.empty:
-            valid_kws = [k for k in keywords if k in region_df.columns]
+        valid_kws = [k for k in keywords if k in region_df.columns] if not region_df.empty else []
+        if valid_kws:
             sel_kw = st.selectbox("Keyword for regional view", valid_kws, key="reg_kw")
 
             st.markdown('<div class="gsa-section">🌍 Global Interest Map</div>', unsafe_allow_html=True)
             st.plotly_chart(ChartBuilder.choropleth_map(region_df, sel_kw), use_container_width=True)
 
-            top20 = processor.get_top_regions(region_df, sel_kw, n=20)
-            st.markdown('<div class="gsa-section">🏆 Top 20 Regions</div>', unsafe_allow_html=True)
-            st.plotly_chart(ChartBuilder.top_regions_bar(top20, sel_kw), use_container_width=True)
+            top_n = config.TOP_REGIONS_N
+            top_regions = DataProcessor.get_top_regions(region_df, sel_kw, n=top_n)
+            st.markdown(
+                f'<div class="gsa-section">🏆 Top {top_n} Regions</div>',
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(
+                ChartBuilder.top_regions_bar(top_regions, sel_kw, n=top_n),
+                use_container_width=True,
+            )
 
             with st.expander("📋 Full Regional Data"):
                 st.dataframe(
-                    region_df.sort_values(by=sel_kw, ascending=False).style.background_gradient(cmap="Purples"),
+                    region_df.sort_values(by=sel_kw, ascending=False)
+                             .style.background_gradient(cmap="Purples", subset=[sel_kw]),
                     use_container_width=True,
                 )
+        elif not region_df.empty:
+            # Region data came back, but not for any of the keywords that
+            # survived. Selecting from an empty list yields None, which used
+            # to reach sort_values(by=None) and raise.
+            st.warning("Regional data does not cover the selected keywords.")
         else:
             st.warning("Regional data not available for this query.")
 
     # ── Tab 3 · Comparison ────────────────────────────────────────────────────
     with t3:
-        if not iot_df.empty:
-            avail = [k for k in keywords if k in iot_df.columns]
+        if iot_df.empty:
+            st.warning("No data available for comparison.")
+        else:
+            avail = keywords
             if len(avail) > 1:
                 c1, c2 = st.columns(2)
                 with c1:
@@ -494,14 +581,14 @@ if st.session_state.analysis_done and st.session_state.data:
                 st.markdown('<div class="gsa-section">📋 Comparison Summary</div>', unsafe_allow_html=True)
                 rows = []
                 for kw in avail:
-                    s = processor.compute_summary_stats(iot_df, kw)
+                    s = DataProcessor.compute_summary_stats(iot_df, kw)
                     rows.append({
                         "Keyword":   kw,
                         "Current":   s.get("current", 0),
                         "Peak":      s.get("peak", 0),
                         "Average":   s.get("avg", 0),
                         "Peak Date": s.get("peak_date", "–"),
-                        "Weekly Δ":  f"{s.get('trend', 0):+.2f}%",
+                        f"Δ per {unit_one}": f"{s.get('trend', 0):+.2f}%",
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
@@ -509,42 +596,48 @@ if st.session_state.analysis_done and st.session_state.data:
 
     # ── Tab 4 · Forecast ──────────────────────────────────────────────────────
     with t4:
-        if not iot_df.empty:
-            avail_fc = [k for k in keywords if k in iot_df.columns]
-            fc_kw    = st.selectbox("Keyword to forecast", avail_fc, key="fc_kw")
+        if not iot_df.empty and keywords:
+            fc_kw = st.selectbox("Keyword to forecast", keywords, key="fc_kw")
 
             if fc_kw:
                 series = iot_df[fc_kw].dropna()
                 if len(series) >= 10:
                     with st.spinner(f"🧮 Computing forecast for '{fc_kw}' …"):
                         forecaster   = TrendForecaster(forecast_periods=forecast_n)
-                        result       = forecaster.get_best_forecast(series)
+                        fc_result    = forecaster.get_best_forecast(series)
+                        # Infer from the data itself rather than the timeframe,
+                        # so the dates match the series that came back.
                         freq         = forecaster.infer_freq(series)
                         future_dates = forecaster.generate_forecast_dates(series.index[-1], freq=freq)
 
-                    st.markdown('<div class="gsa-section">🔮 Trend Forecast with Confidence Interval</div>', unsafe_allow_html=True)
+                    _, fc_unit_many = config.units_for_freq(freq)
+                    st.markdown(
+                        f'<div class="gsa-section">🔮 Next {forecast_n} {fc_unit_many} '
+                        'with 95 % prediction interval</div>',
+                        unsafe_allow_html=True,
+                    )
                     st.plotly_chart(
                         ChartBuilder.forecast_chart(
                             historical_dates=series.index,
                             historical_values=series.values,
                             forecast_dates=future_dates,
-                            forecast_values=result["forecast"],
-                            lower_ci=result["lower_ci"],
-                            upper_ci=result["upper_ci"],
+                            forecast_values=fc_result["forecast"],
+                            lower_ci=fc_result["lower_ci"],
+                            upper_ci=fc_result["upper_ci"],
                             keyword=fc_kw,
-                            method=result.get("method", "Statistical Model"),
+                            method=fc_result.get("method", "Statistical Model"),
                         ),
                         use_container_width=True,
                     )
 
                     # Insight cards
                     ic1, ic2, ic3 = st.columns(3)
-                    avg_fc = float(np.mean(result["forecast"]))
+                    avg_fc = float(np.mean(fc_result["forecast"]))
                     with ic1:
                         st.markdown(
                             f'<div class="gsa-card"><div class="gsa-label">Trend Direction</div>'
-                            f'<div style="font-size:1.25rem;font-weight:700;color:#e0e0e0;margin:.5rem 0;">'
-                            f'{result.get("trend_direction","–")}</div></div>',
+                            f'<div style="font-size:1.25rem;font-weight:700;color:var(--gsa-text-1);margin:.5rem 0;">'
+                            f'{fc_result.get("trend_direction","–")}</div></div>',
                             unsafe_allow_html=True,
                         )
                     with ic2:
@@ -557,16 +650,22 @@ if st.session_state.analysis_done and st.session_state.data:
                         st.markdown(
                             f'<div class="gsa-card"><div class="gsa-label">Method</div>'
                             f'<div style="font-size:0.88rem;font-weight:600;color:#00d4aa;margin:.5rem 0;">'
-                            f'{result.get("method","–")}</div></div>',
+                            f'{fc_result.get("method","–")}</div></div>',
                             unsafe_allow_html=True,
                         )
 
+                    st.caption(
+                        "Google Trends values are a relative index rescaled so the "
+                        "window's peak is 100 — not absolute search volume. Treat the "
+                        "forecast as a direction, not a prediction of traffic."
+                    )
+
                     with st.expander("📋 Forecast Data & Download"):
                         fc_df = pd.DataFrame({
-                            "Date":         future_dates,
-                            "Forecast":     np.round(result["forecast"], 1),
-                            "Lower CI (95%)": np.round(result["lower_ci"], 1),
-                            "Upper CI (95%)": np.round(result["upper_ci"], 1),
+                            "Date":            future_dates,
+                            "Forecast":        np.round(fc_result["forecast"], 1),
+                            "Lower 95% bound": np.round(fc_result["lower_ci"], 1),
+                            "Upper 95% bound": np.round(fc_result["upper_ci"], 1),
                         })
                         st.dataframe(fc_df, use_container_width=True, hide_index=True)
                         st.download_button(
@@ -626,10 +725,10 @@ else:
         """
 <div style="text-align:center;padding:3.5rem 2rem 2rem;">
   <div style="font-size:5.5rem;margin-bottom:1.2rem;">📊</div>
-  <h2 style="color:#e0e0e0;font-size:1.9rem;font-weight:700;margin-bottom:.7rem;">
+  <h2 style="color:var(--gsa-text-1);font-size:1.9rem;font-weight:700;margin-bottom:.7rem;">
     Ready to Analyse
   </h2>
-  <p style="color:#555;font-size:1rem;max-width:480px;margin:0 auto;line-height:1.7;">
+  <p style="color:var(--gsa-text-2);font-size:1rem;max-width:480px;margin:0 auto;line-height:1.7;">
     Type your keywords in the sidebar, pick a timeframe &amp; region,
     then hit <strong style="color:#6c63ff;">Analyse Trends</strong> to explore the data.
   </p>
@@ -642,8 +741,9 @@ else:
     feats = [
         ("📈", "Trend Analysis",   "Track how search interest evolves over any timeframe for any topic"),
         ("🌍", "Global Heatmap",   "See which countries drive search interest with an interactive world map"),
-        ("🔮", "AI Forecasting",   "Predict future search interest using Holt-Winters & polynomial models"),
-        ("⚖️",  "Multi-Keyword",   "Compare up to 5 keywords with radar charts and share-of-interest view"),
+        ("🔮", "Statistical Forecasting",
+                                   "Project future interest with Holt-Winters smoothing & polynomial models"),
+        ("⚖️",  "Multi-Keyword",   f"Compare up to {config.MAX_KEYWORDS} keywords with radar and share-of-interest views"),
         ("🔍", "Related Queries",  "Uncover rising and top queries associated with your keywords"),
         ("⬇️", "Data Export",     "Download raw and forecast data as CSV with one click"),
     ]
@@ -654,8 +754,8 @@ else:
                 f"""
 <div class="gsa-feat">
   <div style="font-size:2.4rem;margin-bottom:.7rem;">{icon}</div>
-  <div style="font-size:1rem;font-weight:600;color:#e0e0e0;margin-bottom:.45rem;">{title}</div>
-  <div style="font-size:0.82rem;color:#555;line-height:1.55;">{desc}</div>
+  <div style="font-size:1rem;font-weight:600;color:var(--gsa-text-1);margin-bottom:.45rem;">{title}</div>
+  <div style="font-size:0.82rem;color:var(--gsa-text-2);line-height:1.55;">{desc}</div>
 </div>""",
                 unsafe_allow_html=True,
             )

@@ -4,10 +4,19 @@ Trend forecasting module.
 Primary method  : Holt-Winters Exponential Smoothing (statsmodels)
 Fallback method : Polynomial Regression (scikit-learn / numpy)
 
-Both produce point forecasts and 95 % confidence / prediction intervals,
-clipped to the Google Trends [0, 100] scale.
+Both produce point forecasts and 95 % prediction intervals, clipped to the
+Google Trends [0, 100] scale.
+
+Note on interval semantics: these are *prediction* intervals (the range a
+future observation is expected to fall in), not confidence intervals on the
+mean. They also inherit the limits of the underlying data — Google Trends
+values are a relative index rescaled so the window's peak is 100, not an
+absolute search volume.
 """
 
+from __future__ import annotations
+
+import logging
 import warnings
 from typing import Tuple
 
@@ -18,7 +27,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.metrics import r2_score
 
-warnings.filterwarnings("ignore")
+import config
+
+logger = logging.getLogger(__name__)
 
 
 class TrendForecaster:
@@ -31,7 +42,7 @@ class TrendForecaster:
     result = forecaster.get_best_forecast(series)   # pandas Series with DatetimeIndex
     """
 
-    def __init__(self, forecast_periods: int = 12):
+    def __init__(self, forecast_periods: int = config.FORECAST_PERIODS):
         self.forecast_periods = forecast_periods
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -46,6 +57,41 @@ class TrendForecaster:
     @staticmethod
     def _clip(arr: np.ndarray) -> np.ndarray:
         return np.clip(arr, 0.0, 100.0)
+
+    # ── Frequency inference ───────────────────────────────────────────────────
+
+    @staticmethod
+    def infer_freq(series: pd.Series) -> str:
+        """
+        Infer a pandas frequency alias from a DatetimeIndex series.
+
+        Uses the mean spacing in *seconds* rather than whole days — sub-daily
+        Trends data (the "past hour" through "past 7 days" windows) has a
+        spacing of 0 days, which previously collapsed every intraday series
+        to a daily frequency.
+        """
+        if len(series) < 2 or not isinstance(series.index, pd.DatetimeIndex):
+            return "W"
+
+        span = series.index[-1] - series.index[0]
+        seconds = span.total_seconds() / max(len(series) - 1, 1)
+
+        if seconds <= 60 * 15:            # up to 15 min apart
+            return "min"
+        if seconds <= 3600 * 3:           # up to 3 h apart
+            return "h"
+        if seconds <= 86400 * 3:          # up to 3 days apart
+            return "D"
+        if seconds <= 86400 * 10:         # up to 10 days apart
+            return "W"
+        if seconds <= 86400 * 45:         # up to ~6 weeks apart
+            return "MS"
+        return "QS"
+
+    @staticmethod
+    def seasonal_period(freq: str) -> int:
+        """Return the seasonal cycle length to try for a given frequency."""
+        return config.SEASONAL_PERIODS.get(freq, 52)
 
     # ── Forecasting methods ───────────────────────────────────────────────────
 
@@ -90,39 +136,43 @@ class TrendForecaster:
 
             n = len(series)
 
-            # Infer a seasonal period from the DatetimeIndex frequency
-            freq = pd.infer_freq(series.index) if isinstance(series.index, pd.DatetimeIndex) else None
-            if freq and freq.startswith("W"):
-                sp = 52
-            elif freq and freq.startswith(("M", "Q")):
-                sp = 12
-            else:
-                sp = 52  # default: weekly
+            # Match the seasonal cycle to the actual spacing of the data. The
+            # old code assumed 52 (weekly-yearly) for every series, which is
+            # meaningless for hourly or daily windows.
+            freq = self.infer_freq(series)
+            sp = self.seasonal_period(freq)
 
-            use_seasonal = (n >= sp * 2)
+            # Need at least two full cycles to estimate a seasonal component.
+            use_seasonal = n >= sp * 2
 
-            model = ExponentialSmoothing(
-                series,
-                trend="add",
-                seasonal="add" if use_seasonal else None,
-                seasonal_periods=sp if use_seasonal else None,
-                initialization_method="estimated",
-            )
-            fit = model.fit(optimized=True, remove_bias=False)
+            # statsmodels emits convergence and frequency warnings freely.
+            # Suppress them only around the fit rather than globally at
+            # import time, so the rest of the app keeps its warnings.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
 
-            y_forecast = self._clip(fit.forecast(self.forecast_periods).values)
-            y_fitted   = fit.fittedvalues.values
+                model = ExponentialSmoothing(
+                    series,
+                    trend="add",
+                    seasonal="add" if use_seasonal else None,
+                    seasonal_periods=sp if use_seasonal else None,
+                    initialization_method="estimated",
+                )
+                fit = model.fit(optimized=True, remove_bias=False)
 
-            # Simulation-based 95 % prediction interval
-            try:
-                sims = fit.simulate(self.forecast_periods, repetitions=200, error="add")
-                lower_ci = self._clip(np.percentile(sims, 2.5,  axis=1))
-                upper_ci = self._clip(np.percentile(sims, 97.5, axis=1))
-            except Exception:
-                std_res  = np.std(series.values - y_fitted)
-                margin   = 1.96 * std_res
-                lower_ci = self._clip(y_forecast - margin)
-                upper_ci = self._clip(y_forecast + margin)
+                y_forecast = self._clip(fit.forecast(self.forecast_periods).values)
+                y_fitted   = fit.fittedvalues.values
+
+                # Simulation-based 95 % prediction interval
+                try:
+                    sims = fit.simulate(self.forecast_periods, repetitions=200, error="add")
+                    lower_ci = self._clip(np.percentile(sims, 2.5,  axis=1))
+                    upper_ci = self._clip(np.percentile(sims, 97.5, axis=1))
+                except Exception:
+                    std_res  = np.std(series.values - y_fitted)
+                    margin   = 1.96 * std_res
+                    lower_ci = self._clip(y_forecast - margin)
+                    upper_ci = self._clip(y_forecast + margin)
 
             return {
                 "fitted":    y_fitted,
@@ -130,11 +180,12 @@ class TrendForecaster:
                 "lower_ci":  lower_ci,
                 "upper_ci":  upper_ci,
                 "aic":       float(fit.aic),
+                "seasonal":  sp if use_seasonal else None,
                 "method":    "Holt-Winters Exponential Smoothing",
             }
 
-        except Exception:
-            # Graceful fallback
+        except Exception as exc:
+            logger.info("Holt-Winters failed (%s); falling back to polynomial.", exc)
             return self.fit_polynomial_trend(series, degree=2)
 
     # ── Date generation ───────────────────────────────────────────────────────
@@ -144,12 +195,24 @@ class TrendForecaster:
         last_date: pd.Timestamp,
         freq: str = "W",
     ) -> pd.DatetimeIndex:
-        """Return *forecast_periods* future dates starting after *last_date*."""
+        """
+        Return *forecast_periods* future dates starting one period after
+        *last_date*.
+
+        Stepping forward by one offset before building the range avoids an
+        off-by-one that used to appear with anchored frequencies. The previous
+        approach — ``date_range(start=last_date, periods=n+1)[1:]`` — assumed
+        ``last_date`` itself would be generated, but pandas only includes it
+        when it happens to align to the anchor. For a mid-month date with
+        freq="MS" the range began at the *next* month start, so slicing off
+        the first element silently dropped a whole period.
+        """
+        offset = pd.tseries.frequencies.to_offset(freq)
         return pd.date_range(
-            start=last_date,
-            periods=self.forecast_periods + 1,
+            start=last_date + offset,
+            periods=self.forecast_periods,
             freq=freq,
-        )[1:]
+        )
 
     # ── Trend direction ───────────────────────────────────────────────────────
 
@@ -184,26 +247,9 @@ class TrendForecaster:
         """
         try:
             result = self.fit_exponential_smoothing(series)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Forecast fell back to polynomial regression: %s", exc)
             result = self.fit_polynomial_trend(series, degree=2)
 
         result["trend_direction"] = self.detect_trend_direction(series)
         return result
-
-    # ── Frequency inference ───────────────────────────────────────────────────
-
-    @staticmethod
-    def infer_freq(series: pd.Series) -> str:
-        """Infer pandas frequency string from a DatetimeIndex series."""
-        if len(series) < 2 or not isinstance(series.index, pd.DatetimeIndex):
-            return "W"
-        delta = (series.index[-1] - series.index[0]) / max(len(series) - 1, 1)
-        days  = delta.days
-        if days <= 1:
-            return "D"
-        elif days <= 7:
-            return "W"
-        elif days <= 31:
-            return "MS"
-        else:
-            return "QS"

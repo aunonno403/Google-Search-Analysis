@@ -2,9 +2,10 @@
 Data cleaning, transformation, and summary-statistics utilities.
 """
 
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
-from typing import Optional
+import pandas as pd
 
 
 class DataProcessor:
@@ -22,20 +23,63 @@ class DataProcessor:
         return df.fillna(0)
 
     @staticmethod
+    def compute_growth_rate(series: pd.Series) -> float:
+        """
+        Return the average per-period growth rate of *series* as a percentage.
+
+        Fitting a line to log(values) and exponentiating the slope gives a
+        geometric growth rate. Two things make this preferable to
+        ``series.pct_change().mean()``:
+
+        * Google Trends returns 0 for low-volume periods, and ``pct_change``
+          divides by the previous value — a single 0 turns the mean into
+          ``inf`` (which used to render as "inf% avg weekly change").
+        * The arithmetic mean of percentage changes is upward biased: +50%
+          followed by -50% averages to 0% but is really a 25% loss.
+
+        Zero and missing periods are dropped before fitting. Returns 0.0 when
+        fewer than two usable points remain.
+        """
+        if series is None or len(series) < 2:
+            return 0.0
+
+        values = pd.to_numeric(series, errors="coerce")
+        # log() needs strictly positive input; 0-interest periods carry no
+        # usable ratio information, so they are excluded from the fit.
+        positive = values[values > 0].dropna()
+        if len(positive) < 2:
+            return 0.0
+
+        # Fit against real elapsed position so gaps don't distort the slope.
+        x = np.arange(len(positive), dtype=float)
+        slope = np.polyfit(x, np.log(positive.to_numpy(dtype=float)), 1)[0]
+
+        rate = (np.exp(slope) - 1.0) * 100.0
+        if not np.isfinite(rate):
+            return 0.0
+        return float(round(rate, 2))
+
+    @staticmethod
     def compute_summary_stats(df: pd.DataFrame, keyword: str) -> dict:
         """
-        Return a dict with current, peak, average, trend (avg % weekly change),
-        and the date of the peak for *keyword*.
+        Return a dict with current, peak, average, trend (avg % change per
+        period), and the date of the peak for *keyword*.
+
+        Returns ``{}`` when the keyword is absent or has no usable values.
         """
         if df is None or df.empty or keyword not in df.columns:
             return {}
-        series = df[keyword]
+
+        series = pd.to_numeric(df[keyword], errors="coerce").dropna()
+        if series.empty:
+            return {}
+
         peak_date = series.idxmax()
         return {
             "current":   int(series.iloc[-1]),
             "peak":      int(series.max()),
             "avg":       float(round(series.mean(), 1)),
-            "trend":     float(round(series.pct_change().mean() * 100, 2)),
+            "trend":     DataProcessor.compute_growth_rate(series),
             "peak_date": peak_date.strftime("%b %d, %Y")
                          if hasattr(peak_date, "strftime") else str(peak_date),
         }
@@ -53,17 +97,3 @@ class DataProcessor:
         if df is None or df.empty or keyword not in df.columns:
             return pd.DataFrame()
         return df.nlargest(n, keyword)
-
-    # ── Normalisation ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-        """Rescale every column to [0, 100] independently."""
-        if df is None or df.empty:
-            return df
-        result = df.copy()
-        for col in result.columns:
-            col_max = result[col].max()
-            if col_max > 0:
-                result[col] = (result[col] / col_max * 100).round(1)
-        return result

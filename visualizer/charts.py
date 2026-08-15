@@ -7,7 +7,7 @@ purple → teal color palette to match the Streamlit dashboard theme.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -15,11 +15,18 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 import config
+from analyzer.geo import to_alpha3
+from analyzer.processor import DataProcessor
 
 # ─── Palette ──────────────────────────────────────────────────────────────────
+# Built from the themed colours in config so the charts and the dashboard CSS
+# can't drift apart.
 PALETTE = [
-    "#6c63ff", "#00d4aa", "#ffa726", "#ff6b6b",
-    "#42a5f5", "#ab47bc", "#66bb6a", "#ef5350",
+    config.PRIMARY_COLOR,
+    config.SECONDARY_COLOR,
+    config.WARNING_COLOR,
+    config.DANGER_COLOR,
+    *config.EXTRA_SERIES_COLORS,
 ]
 
 _GRID   = "rgba(255,255,255,0.06)"
@@ -84,7 +91,7 @@ class ChartBuilder:
 
             # Smoothed / main trace
             y_display = (
-                series.rolling(window=4, center=True, min_periods=1).mean()
+                DataProcessor.compute_rolling_average(series, window=4)
                 if smooth and len(series) > 4
                 else series
             )
@@ -131,13 +138,32 @@ class ChartBuilder:
             return go.Figure()
 
         df_r = df.reset_index()
-        loc_col  = "geoCode" if "geoCode" in df_r.columns else "geoName"
-        loc_mode = None if loc_col == "geoCode" else "country names"
+        if "geoName" not in df_r.columns:
+            return go.Figure()
+
+        # pytrends' `geoCode` column holds ISO 3166-1 *alpha-2* codes ("US",
+        # "IN"), but Plotly's default locationmode is ISO-3 ("USA", "IND").
+        # Passing alpha-2 codes with locationmode left at None meant nothing
+        # matched, and Plotly drops unmatched rows silently instead of
+        # erroring — so the map rendered empty with no indication why.
+        #
+        # Convert to alpha-3 and match on ISO-3 explicitly. The alternative,
+        # locationmode="country names", is deprecated in Plotly and matches on
+        # fragile English names rather than codes.
+        if "geoCode" in df_r.columns:
+            df_r = df_r.assign(_iso3=df_r["geoCode"].map(to_alpha3))
+            df_r = df_r[df_r["_iso3"].notna()]
+            if df_r.empty:
+                return go.Figure()
+            locations, locationmode = "_iso3", "ISO-3"
+        else:
+            # No codes available — fall back to name matching.
+            locations, locationmode = "geoName", "country names"
 
         fig = px.choropleth(
             df_r,
-            locations=loc_col,
-            locationmode=loc_mode,
+            locations=locations,
+            locationmode=locationmode,
             color=keyword,
             hover_name="geoName",
             color_continuous_scale=[
@@ -173,9 +199,19 @@ class ChartBuilder:
     # ── Top regions horizontal bar chart ─────────────────────────────────────
 
     @staticmethod
-    def top_regions_bar(df: pd.DataFrame, keyword: str, n: int = 15) -> go.Figure:
-        """Horizontal gradient bar chart ranking regions by interest."""
-        if keyword not in df.columns:
+    def top_regions_bar(
+        df: pd.DataFrame,
+        keyword: str,
+        n: int = config.TOP_REGIONS_N,
+    ) -> go.Figure:
+        """
+        Horizontal gradient bar chart ranking regions by interest.
+
+        *n* defaults to the same config value the caller uses to slice the
+        data and to build the heading, so the chart can no longer show 15
+        bars under a "Top 20 Regions" title.
+        """
+        if df is None or df.empty or keyword not in df.columns:
             return go.Figure()
 
         top = df[[keyword]].sort_values(by=keyword, ascending=True).tail(n)
@@ -223,42 +259,54 @@ class ChartBuilder:
         method: str,
     ) -> go.Figure:
         """
-        Combined historical + forecast chart with a shaded 95 % CI band
-        and a vertical dashed divider marking where the forecast begins.
+        Combined historical + forecast chart with a shaded 95 % prediction
+        band and a vertical dashed divider marking where the forecast begins.
         """
         fig = go.Figure()
 
+        hist_dates  = list(historical_dates)
+        hist_values = list(historical_values)
+
         # Historical
         fig.add_trace(go.Scatter(
-            x=historical_dates, y=historical_values,
+            x=hist_dates, y=hist_values,
             name="Historical",
             mode="lines",
-            line=dict(color="#6c63ff", width=2),
+            line=dict(color=config.PRIMARY_COLOR, width=2),
             hovertemplate=(
                 "<b>Historical</b><br>%{x|%b %d, %Y}<br>"
                 "Interest: %{y:.1f}<extra></extra>"
             ),
         ))
 
-        # CI band
+        # Prediction band
         fd_list = list(forecast_dates)
         fig.add_trace(go.Scatter(
             x=fd_list + fd_list[::-1],
             y=list(upper_ci) + list(lower_ci[::-1]),
             fill="toself",
-            fillcolor=_rgba("#00d4aa", 0.10),
+            fillcolor=_rgba(config.SECONDARY_COLOR, 0.10),
             line=dict(color="rgba(0,0,0,0)"),
-            name="95 % Confidence",
+            name="95 % prediction interval",
             hoverinfo="skip",
         ))
 
-        # Forecast line
+        # Forecast line. Prepend the final historical point so the dashed
+        # forecast visually continues the solid history instead of starting
+        # one period adrift with a gap between them.
+        fc_x = fd_list
+        fc_y = list(forecast_values)
+        if hist_dates:
+            fc_x = [hist_dates[-1]] + fc_x
+            fc_y = [hist_values[-1]] + fc_y
+
         fig.add_trace(go.Scatter(
-            x=forecast_dates, y=forecast_values,
+            x=fc_x, y=fc_y,
             name="Forecast",
             mode="lines+markers",
-            line=dict(color="#00d4aa", width=2.5, dash="dash"),
-            marker=dict(size=6, color="#00d4aa", line=dict(color="white", width=1)),
+            line=dict(color=config.SECONDARY_COLOR, width=2.5, dash="dash"),
+            marker=dict(size=6, color=config.SECONDARY_COLOR,
+                        line=dict(color="white", width=1)),
             hovertemplate=(
                 "<b>Forecast</b><br>%{x|%b %d, %Y}<br>"
                 "Predicted: %{y:.1f}<extra></extra>"
@@ -266,9 +314,9 @@ class ChartBuilder:
         ))
 
         # Divider
-        if len(historical_dates):
+        if hist_dates:
             fig.add_vline(
-                x=historical_dates[-1],
+                x=hist_dates[-1],
                 line_dash="dot",
                 line_color="rgba(255,255,255,0.25)",
                 annotation_text="Forecast →",
@@ -319,7 +367,7 @@ class ChartBuilder:
             return go.Figure()
 
         df   = df.head(15)
-        base = "#ffa726" if query_type == "rising" else "#6c63ff"
+        base = config.WARNING_COLOR if query_type == "rising" else config.PRIMARY_COLOR
 
         fig = go.Figure(go.Bar(
             x=df["value"],
@@ -355,21 +403,35 @@ class ChartBuilder:
 
     @staticmethod
     def comparison_radar(df: pd.DataFrame, keywords: List[str]) -> go.Figure:
-        """Polar/radar chart comparing keywords across five performance dimensions."""
-        AXES = ["Peak Interest", "Current Interest", "Avg Interest", "Volatility", "Trend Score"]
+        """
+        Polar/radar chart comparing keywords across five dimensions.
+
+        Every axis is oriented so that "further out is better", which a radar
+        chart implies visually. "Volatility" used to break that rule — a wildly
+        erratic keyword drew the largest shape — so it is plotted as its
+        inverse, Stability.
+
+        The axes are still not commensurate (an interest index and a
+        dispersion measure share one 0–100 radial scale), so read this as a
+        shape comparison rather than as a total score.
+        """
+        AXES = ["Peak Interest", "Current Interest", "Avg Interest", "Stability", "Trend Score"]
 
         fig = go.Figure()
         for i, kw in enumerate(keywords):
             if kw not in df.columns:
                 continue
-            s = df[kw]
+            s = df[kw].dropna()
+            if s.empty:
+                continue
             mid   = len(s) // 2
             trend = float(np.clip(s.iloc[mid:].mean() - s.iloc[:mid].mean() + 50, 0, 100))
+            stability = float(100.0 - np.clip(s.std(), 0, 100)) if len(s) > 1 else 100.0
             vals  = [
                 float(s.max()),
                 float(s.iloc[-1]),
                 float(s.mean()),
-                float(np.clip(s.std(), 0, 100)),
+                stability,
                 trend,
             ]
             color = PALETTE[i % len(PALETTE)]

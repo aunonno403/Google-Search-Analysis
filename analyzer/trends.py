@@ -2,9 +2,10 @@
 Pytrends data fetching wrapper with retry logic and rate limiting.
 """
 
+from __future__ import annotations
+
 import time
 import logging
-from typing import Optional
 
 import pandas as pd
 from pytrends.request import TrendReq
@@ -51,9 +52,9 @@ class TrendsAnalyzer:
 
     def build_payload(
         self,
-        kw_list: list,
-        timeframe: str = "today 12-m",
-        geo: str = "",
+        kw_list: list[str],
+        timeframe: str = config.DEFAULT_TIMEFRAME,
+        geo: str = config.DEFAULT_GEO,
         cat: int = 0,
     ) -> None:
         """Build pytrends payload with retry logic."""
@@ -66,6 +67,10 @@ class TrendsAnalyzer:
                 self._stamp()
                 return
             except Exception as exc:
+                # Stamp failures too, so the rate limiter still spaces out
+                # the retry attempts instead of measuring from the last
+                # *successful* call.
+                self._stamp()
                 logger.warning("build_payload attempt %d/%d failed: %s", attempt, config.RETRY_ATTEMPTS, exc)
                 if attempt < config.RETRY_ATTEMPTS:
                     wait = config.RETRY_DELAY * attempt
@@ -128,3 +133,60 @@ class TrendsAnalyzer:
         except Exception as exc:
             logger.error("suggestions failed for '%s': %s", keyword, exc)
             return []
+
+    # ── Orchestration ─────────────────────────────────────────────────────────
+
+    def fetch_all(
+        self,
+        keywords: list[str],
+        timeframe: str = config.DEFAULT_TIMEFRAME,
+        geo: str = config.DEFAULT_GEO,
+        suggestion_limit: int = 2,
+    ) -> dict:
+        """
+        Run the full fetch sequence and return a plain dict of results.
+
+        Only interest-over-time is required; the optional sections degrade to
+        empty values with a recorded warning rather than failing the run.
+
+        Pacing between calls is handled by ``_rate_limit`` alone — callers
+        should not add their own sleeps on top.
+
+        The returned dict is plain data (DataFrames, dicts, lists), which
+        makes it safe to memoise with ``st.cache_data``.
+        """
+        self.build_payload(keywords, timeframe=timeframe, geo=geo)
+
+        result: dict = {
+            "iot_df":      self.get_interest_over_time(),
+            "region_df":   pd.DataFrame(),
+            "related":     {},
+            "suggestions": [],
+            "warnings":    [],
+        }
+
+        try:
+            result["region_df"] = self.get_interest_by_region()
+        except Exception as exc:
+            logger.warning("interest_by_region failed: %s", exc)
+            result["warnings"].append(f"Regional data unavailable: {exc}")
+
+        try:
+            result["related"] = self.get_related_queries()
+        except Exception as exc:
+            logger.warning("related_queries failed: %s", exc)
+            result["warnings"].append(f"Related queries unavailable: {exc}")
+
+        # Suggestions are the least important section and the most requests,
+        # so only the first few keywords are looked up.
+        for kw in keywords[:suggestion_limit]:
+            try:
+                suggestions = self.get_suggestions(kw)
+                if suggestions:
+                    result["suggestions"].append(
+                        {"keyword": kw, "suggestions": suggestions}
+                    )
+            except Exception as exc:
+                logger.warning("suggestions failed for '%s': %s", kw, exc)
+
+        return result
