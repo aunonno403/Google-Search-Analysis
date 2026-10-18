@@ -4,6 +4,8 @@ An interactive Streamlit dashboard for exploring Google Trends data: track
 search interest over time, compare keywords, map regional interest, and project
 near-term trends.
 
+**Live app:** <https://app-search-analysis-8mhkyijq8p7ejpkbjvmzff.streamlit.app/>
+
 ## Quick start
 
 ```bash
