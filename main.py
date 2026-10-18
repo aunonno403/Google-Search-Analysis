@@ -77,9 +77,11 @@ st.markdown(
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 
-/* Hide default chrome */
-#MainMenu, footer, header { visibility: hidden; }
-.stDeployButton { display: none !important; }
+/* Hide default chrome. Keep the header itself: it holds the button that
+   reopens a collapsed sidebar, the only way back to the inputs on a phone. */
+#MainMenu, footer { visibility: hidden; }
+header[data-testid="stHeader"] { background: transparent; }
+.stDeployButton, [data-testid="stAppDeployButton"] { display: none !important; }
 
 /* App background */
 .stApp {
@@ -144,7 +146,7 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
 /* ── Hero ── */
 .gsa-hero { text-align: center; padding: 2.2rem 1rem 1.4rem; }
 .gsa-hero h1 {
-    font-size: 3rem;
+    font-size: clamp(2rem, 7vw, 3rem);
     font-weight: 800;
     background: linear-gradient(130deg, #6c63ff 0%, #00d4aa 100%);
     -webkit-background-clip: text;
@@ -369,7 +371,7 @@ with st.sidebar:
     # horizon is not always in weeks: "Past 7 days" returns hourly data and
     # "2004 – present" returns monthly. Label the slider in the unit the
     # selected timeframe will actually return.
-    _freq, _unit_one, _unit_many = config.granularity_for(timeframe)
+    _, _unit_one, _unit_many = config.granularity_for(timeframe)
     forecast_n = st.slider(
         f"Forecast horizon ({_unit_many})",
         config.FORECAST_MIN_PERIODS,
@@ -407,6 +409,11 @@ if run_analysis:
                 # Pacing between requests lives inside TrendsAnalyzer; this
                 # call is cached, so repeat runs of the same query are free.
                 result = fetch_trends(tuple(keywords), timeframe, geo)
+                if result["warnings"]:
+                    # Don't serve a partly failed fetch for an hour; let the
+                    # next click retry. Clears every cached query, which is
+                    # fine at single-user load.
+                    fetch_trends.clear()
 
                 iot_df = DataProcessor.clean_interest_over_time(result["iot_df"])
 
@@ -417,13 +424,10 @@ if run_analysis:
 
                 store: dict = {
                     "keywords":    returned,
-                    "requested":   keywords,
                     "dropped":     dropped,
-                    "tf_label":    tf_label,
-                    "geo_label":   geo_label,
-                    "freq":        _freq,
                     "unit_one":    _unit_one,
-                    "unit_many":   _unit_many,
+                    "query":       (tuple(keywords), timeframe, geo),
+                    "query_label": f"{tf_label} · {geo_label}",
                     "iot_df":      iot_df,
                     "region_df":   result["region_df"],
                     "related":     result["related"],
@@ -455,6 +459,9 @@ if run_analysis:
 # Surface non-fatal fetch problems and dropped keywords on every rerun, not
 # just the one that triggered the fetch.
 if st.session_state.analysis_done and st.session_state.data:
+    if st.session_state.data.get("query") != (tuple(keywords), timeframe, geo):
+        st.info("The sidebar has changed since this analysis. "
+                "Click **Analyse Trends** to update the results.")
     for _msg in st.session_state.data.get("warnings", []):
         st.warning(_msg)
     _dropped = st.session_state.data.get("dropped", [])
@@ -479,6 +486,7 @@ if st.session_state.analysis_done and st.session_state.data:
     # ── Summary metric cards ───────────────────────────────────────────────────
     if not iot_df.empty and keywords:
         st.markdown("### 📊 Snapshot")
+        st.caption(f"Results for {store.get('query_label', '')}")
         # Size the column grid to the keywords that have data, so a dropped
         # keyword no longer leaves an unexplained empty slot.
         cols = st.columns(len(keywords))
@@ -495,12 +503,28 @@ if st.session_state.analysis_done and st.session_state.data:
 <div class="gsa-card">
   <div class="gsa-label">{html.escape(kw)}</div>
   <div class="gsa-value">{stats.get('current','–')}</div>
+  <div class="gsa-sub">Current interest (% of peak)</div>
   <div class="gsa-sub">Peak: <b>{stats.get('peak','–')}</b> on {stats.get('peak_date','–')}</div>
   <div class="gsa-sub">Avg: {stats.get('avg','–')}</div>
   <div class="gsa-delta {dc}">{sym} {abs(trend):.2f}% avg change per {unit_one}</div>
 </div>""",
                     unsafe_allow_html=True,
                 )
+
+        with st.expander("ℹ️ What do these scores mean?"):
+            st.markdown(
+                "Scores are **not search counts**. They are Google Trends' relative index:\n\n"
+                "- **100** is the busiest point for the most-searched keyword in this "
+                "analysis, for the timeframe and region shown above. Every other value is "
+                "a percentage of that peak; **0** means too little data.\n"
+                "- Interest is measured as a **share of all Google searches** in that place "
+                "and time, so bigger countries or busier years don't win by size alone.\n"
+                "- Keywords in **this** analysis share one scale: 46 vs 23 means about twice "
+                "the interest.\n"
+                "- The scale resets whenever the keywords, timeframe or region change, so "
+                "**don't compare scores across analyses**.\n"
+                f"- **Current** is the latest complete {unit_one}; the unfinished one is left out."
+            )
 
     st.markdown("---")
 

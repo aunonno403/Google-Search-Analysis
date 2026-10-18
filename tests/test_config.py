@@ -32,6 +32,7 @@ class TestGranularityFor:
     @pytest.mark.parametrize("timeframe,freq", [
         ("now 1-H",     "min"),
         ("now 4-H",     "min"),
+        ("now 1-d",     "8min"),
         ("now 7-d",     "h"),
         ("today 1-m",   "D"),
         ("today 3-m",   "D"),

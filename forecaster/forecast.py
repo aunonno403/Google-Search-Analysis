@@ -2,7 +2,7 @@
 Trend forecasting module.
 
 Primary method  : Holt-Winters Exponential Smoothing (statsmodels)
-Fallback method : Polynomial Regression (scikit-learn / numpy)
+Fallback method : Polynomial Regression (numpy)
 
 Both produce point forecasts and 95 % prediction intervals, clipped to the
 Google Trends [0, 100] scale.
@@ -18,14 +18,9 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.metrics import r2_score
 
 import config
 
@@ -46,13 +41,6 @@ class TrendForecaster:
         self.forecast_periods = forecast_periods
 
     # ── Internal helpers ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _to_array(series: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-        """Return integer-indexed X and the raw values y."""
-        X = np.arange(len(series)).reshape(-1, 1)
-        y = series.values.astype(float)
-        return X, y
 
     @staticmethod
     def _clip(arr: np.ndarray) -> np.ndarray:
@@ -76,8 +64,10 @@ class TrendForecaster:
         span = series.index[-1] - series.index[0]
         seconds = span.total_seconds() / max(len(series) - 1, 1)
 
-        if seconds <= 60 * 15:            # up to 15 min apart
+        if seconds <= 60 * 2:             # up to 2 min apart
             return "min"
+        if seconds <= 60 * 15:            # "Past day" comes in 8-minute buckets
+            return "8min"
         if seconds <= 3600 * 3:           # up to 3 h apart
             return "h"
         if seconds <= 86400 * 3:          # up to 3 days apart
@@ -100,17 +90,13 @@ class TrendForecaster:
         Fit a polynomial regression of *degree* to *series* and forecast
         *self.forecast_periods* periods ahead.
         """
-        X, y = self._to_array(series)
+        y = series.to_numpy(dtype=float)
+        x = np.arange(len(y))
+        coef = np.polyfit(x, y, degree)
 
-        pipe = Pipeline([
-            ("poly",   PolynomialFeatures(degree=degree, include_bias=False)),
-            ("linear", LinearRegression()),
-        ])
-        pipe.fit(X, y)
-
-        X_future = np.arange(len(series), len(series) + self.forecast_periods).reshape(-1, 1)
-        y_fitted   = pipe.predict(X)
-        y_forecast = self._clip(pipe.predict(X_future))
+        x_future   = np.arange(len(y), len(y) + self.forecast_periods)
+        y_fitted   = np.polyval(coef, x)
+        y_forecast = self._clip(np.polyval(coef, x_future))
 
         residuals    = y - y_fitted
         std_res      = np.std(residuals)
@@ -121,7 +107,6 @@ class TrendForecaster:
             "forecast":  y_forecast,
             "lower_ci":  self._clip(y_forecast - margin),
             "upper_ci":  self._clip(y_forecast + margin),
-            "r2":        float(r2_score(y, y_fitted)),
             "method":    f"Polynomial Regression (degree {degree})",
         }
 
@@ -179,7 +164,6 @@ class TrendForecaster:
                 "forecast":  y_forecast,
                 "lower_ci":  lower_ci,
                 "upper_ci":  upper_ci,
-                "aic":       float(fit.aic),
                 "seasonal":  sp if use_seasonal else None,
                 "method":    "Holt-Winters Exponential Smoothing",
             }
@@ -245,11 +229,6 @@ class TrendForecaster:
         Try Holt-Winters first; fall back to polynomial regression.
         Always attaches a 'trend_direction' key to the result dict.
         """
-        try:
-            result = self.fit_exponential_smoothing(series)
-        except Exception as exc:
-            logger.warning("Forecast fell back to polynomial regression: %s", exc)
-            result = self.fit_polynomial_trend(series, degree=2)
-
+        result = self.fit_exponential_smoothing(series)
         result["trend_direction"] = self.detect_trend_direction(series)
         return result

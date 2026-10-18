@@ -103,7 +103,7 @@ class ChartBuilder:
                 fill=fill,
                 fillcolor=fill_c,
                 hovertemplate=(
-                    f"<b>{kw}</b><br>%{{x|%b %d, %Y}}<br>"
+                    f"<b>{kw}</b><br>%{{x}}<br>"
                     "Interest: %{y:.1f}<extra></extra>"
                 ),
             ))
@@ -121,7 +121,7 @@ class ChartBuilder:
                 rangeslider=dict(visible=True, bgcolor="rgba(255,255,255,0.03)"),
             ),
             yaxis=dict(
-                title="Search Interest (0–100)",
+                title="Search interest (% of peak)",
                 showgrid=True, gridwidth=0.5, gridcolor=_GRID,
                 range=[0, 108],
             ),
@@ -236,7 +236,7 @@ class ChartBuilder:
             plot_bgcolor=_PAPER,
             font=_FONT,
             xaxis=dict(
-                title="Search Interest",
+                title="Search interest (% of top region)",
                 showgrid=True, gridwidth=0.5, gridcolor=_GRID,
                 range=[0, 120],
             ),
@@ -274,7 +274,7 @@ class ChartBuilder:
             mode="lines",
             line=dict(color=config.PRIMARY_COLOR, width=2),
             hovertemplate=(
-                "<b>Historical</b><br>%{x|%b %d, %Y}<br>"
+                "<b>Historical</b><br>%{x}<br>"
                 "Interest: %{y:.1f}<extra></extra>"
             ),
         ))
@@ -308,7 +308,7 @@ class ChartBuilder:
             marker=dict(size=6, color=config.SECONDARY_COLOR,
                         line=dict(color="white", width=1)),
             hovertemplate=(
-                "<b>Forecast</b><br>%{x|%b %d, %Y}<br>"
+                "<b>Forecast</b><br>%{x}<br>"
                 "Predicted: %{y:.1f}<extra></extra>"
             ),
         ))
@@ -333,7 +333,7 @@ class ChartBuilder:
             hovermode="x unified",
             xaxis=dict(showgrid=True, gridwidth=0.5, gridcolor=_GRID),
             yaxis=dict(
-                title="Search Interest (0–100)",
+                title="Search interest (% of peak)",
                 showgrid=True, gridwidth=0.5, gridcolor=_GRID,
                 range=[0, 110],
             ),
@@ -485,7 +485,7 @@ class ChartBuilder:
                 stackgroup="one",
                 line=dict(color=color, width=0.5),
                 fillcolor=_rgba(color, 0.55),
-                hovertemplate=f"<b>{kw}</b><br>%{{x|%b %Y}}<br>Share: %{{y:.1f}}%<extra></extra>",
+                hovertemplate=f"<b>{kw}</b><br>%{{x}}<br>Share: %{{y:.1f}}%<extra></extra>",
             ))
 
         fig.update_layout(

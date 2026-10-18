@@ -83,7 +83,8 @@ forecast horizon accordingly:
 | Timeframe | Resolution |
 |-----------|-----------|
 | Past hour / 4 hours | minutes |
-| Past day / 7 days | hours |
+| Past day | 8-minute periods |
+| Past 7 days | hours |
 | Past 30 / 90 days | days |
 | Past 12 months / 5 years | weeks |
 | 2004 – present | months |
@@ -96,7 +97,7 @@ endpoints, so HTTP 429 responses are common. The app mitigates this by:
 - Memoising each `(keywords, timeframe, geo)` query for one hour
   (`config.CACHE_TTL`), so reruns and tab switches cost no requests.
 - Spacing requests inside `TrendsAnalyzer` with a minimum interval.
-- Retrying `build_payload` with a growing delay.
+- Retrying `build_payload` and `interest_over_time` with a growing delay.
 
 If you still get rate-limited, wait a minute and try again. Cached results stay
 available in the meantime.

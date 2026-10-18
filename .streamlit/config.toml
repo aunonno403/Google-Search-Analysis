@@ -1,0 +1,5 @@
+# The custom CSS in main.py paints a dark page; without this, a light OS theme
+# gives light widgets on that dark page and their text becomes unreadable.
+[theme]
+base = "dark"
+primaryColor = "#6c63ff"

@@ -87,6 +87,7 @@ EXTRA_SERIES_COLORS = ["#42a5f5", "#ab47bc", "#66bb6a", "#ef5350"]
 # slider label, the metric cards, and the forecast heading always agree.
 FREQ_UNITS = {
     "min": ("minute",  "minutes"),
+    "8min": ("8-minute period", "8-minute periods"),
     "h":   ("hour",    "hours"),
     "D":   ("day",     "days"),
     "W":   ("week",    "weeks"),
@@ -103,7 +104,7 @@ def units_for_freq(freq: str) -> tuple[str, str]:
 # Each entry is (max_span_in_days, pandas_freq_alias).
 _GRANULARITY_RULES = [
     (0.21,    "min"),   # < ~5 hours  → 1-minute buckets
-    (1.5,     "min"),   # < ~36 hours → 8-minute buckets
+    (1.5,     "8min"),  # < ~36 hours → 8-minute buckets
     (8.0,     "h"),     # < 8 days    → hourly
     (270.0,   "D"),     # < ~9 months → daily
     (1826.0,  "W"),     # < ~5 years  → weekly
@@ -163,6 +164,7 @@ def granularity_for(timeframe: str) -> tuple[str, str, str]:
 # Seasonal cycle length to try for each granularity, used by the forecaster.
 SEASONAL_PERIODS = {
     "min": 60,    # an hour of minute buckets
+    "8min": 180,  # daily cycle; a 1-day window never has two, so no seasonal fit
     "h":   24,    # daily cycle
     "D":   7,     # weekly cycle
     "W":   52,    # yearly cycle

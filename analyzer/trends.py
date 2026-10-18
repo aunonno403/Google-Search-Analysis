@@ -48,6 +48,28 @@ class TrendsAnalyzer:
         """Record the time of the last request."""
         self._last_request_time = time.time()
 
+    def _retry(self, name: str, fn, *args, **kwargs):
+        """Call *fn* with rate limiting, retrying with a growing delay."""
+        for attempt in range(1, config.RETRY_ATTEMPTS + 1):
+            try:
+                self._rate_limit()
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                logger.warning("%s attempt %d/%d failed: %s", name, attempt, config.RETRY_ATTEMPTS, exc)
+            finally:
+                # Stamp failures too, so the rate limiter still spaces out
+                # the retry attempts instead of measuring from the last
+                # *successful* call.
+                self._stamp()
+            if attempt < config.RETRY_ATTEMPTS:
+                wait = config.RETRY_DELAY * attempt
+                logger.info("Waiting %ds before retry …", wait)
+                time.sleep(wait)
+        raise RuntimeError(
+            f"{name} failed after {config.RETRY_ATTEMPTS} attempts. "
+            "Google may be rate-limiting your IP. Please wait a minute and try again."
+        )
+
     # ── Payload builder ───────────────────────────────────────────────────────
 
     def build_payload(
@@ -58,81 +80,53 @@ class TrendsAnalyzer:
         cat: int = 0,
     ) -> None:
         """Build pytrends payload with retry logic."""
-        for attempt in range(1, config.RETRY_ATTEMPTS + 1):
-            try:
-                self._rate_limit()
-                self.pytrends.build_payload(
-                    kw_list, cat=cat, timeframe=timeframe, geo=geo
-                )
-                self._stamp()
-                return
-            except Exception as exc:
-                # Stamp failures too, so the rate limiter still spaces out
-                # the retry attempts instead of measuring from the last
-                # *successful* call.
-                self._stamp()
-                logger.warning("build_payload attempt %d/%d failed: %s", attempt, config.RETRY_ATTEMPTS, exc)
-                if attempt < config.RETRY_ATTEMPTS:
-                    wait = config.RETRY_DELAY * attempt
-                    logger.info("Waiting %ds before retry …", wait)
-                    time.sleep(wait)
-        raise RuntimeError(
-            f"build_payload failed after {config.RETRY_ATTEMPTS} attempts. "
-            "Google may be rate-limiting your IP. Please wait a minute and try again."
+        self._retry(
+            "build_payload", self.pytrends.build_payload,
+            kw_list, cat=cat, timeframe=timeframe, geo=geo,
         )
 
     # ── Data fetchers ─────────────────────────────────────────────────────────
+    #
+    # The optional fetchers below let errors propagate: fetch_all() turns
+    # them into user-visible warnings.
 
     def get_interest_over_time(self) -> pd.DataFrame:
-        """Fetch interest-over-time data, dropping the 'isPartial' column."""
-        self._rate_limit()
-        df: pd.DataFrame = self.pytrends.interest_over_time()
-        self._stamp()
-        if df is not None and not df.empty and "isPartial" in df.columns:
-            df = df.drop(columns=["isPartial"])
-        return df if df is not None else pd.DataFrame()
+        """Fetch interest-over-time data without the unfinished last period."""
+        df = self._retry("interest_over_time", self.pytrends.interest_over_time)
+        if df is None:
+            return pd.DataFrame()
+        if "isPartial" in df.columns:
+            # The partial period (e.g. the current week) is incomplete and
+            # reads low, which skews "current", the trend and the forecast.
+            df = df[~df["isPartial"].astype(bool)].drop(columns=["isPartial"])
+        return df
 
     def get_interest_by_region(self, resolution: str = "COUNTRY") -> pd.DataFrame:
         """Fetch interest-by-region data at the specified resolution."""
         self._rate_limit(2.0)
-        df: pd.DataFrame = self.pytrends.interest_by_region(
-            resolution=resolution, inc_low_vol=True, inc_geo_code=True
-        )
-        self._stamp()
+        try:
+            df = self.pytrends.interest_by_region(
+                resolution=resolution, inc_low_vol=True, inc_geo_code=True
+            )
+        finally:
+            self._stamp()
         return df if df is not None else pd.DataFrame()
 
     def get_related_queries(self) -> dict:
         """Fetch related queries dict keyed by keyword."""
         self._rate_limit(2.0)
         try:
-            result = self.pytrends.related_queries()
+            return self.pytrends.related_queries() or {}
+        finally:
             self._stamp()
-            return result or {}
-        except Exception as exc:
-            logger.error("related_queries failed: %s", exc)
-            return {}
-
-    def get_related_topics(self) -> dict:
-        """Fetch related topics dict keyed by keyword."""
-        self._rate_limit(2.0)
-        try:
-            result = self.pytrends.related_topics()
-            self._stamp()
-            return result or {}
-        except Exception as exc:
-            logger.error("related_topics failed: %s", exc)
-            return {}
 
     def get_suggestions(self, keyword: str) -> list:
         """Fetch autocomplete keyword suggestions for *keyword*."""
         self._rate_limit()
         try:
-            result = self.pytrends.suggestions(keyword=keyword)
+            return self.pytrends.suggestions(keyword=keyword) or []
+        finally:
             self._stamp()
-            return result or []
-        except Exception as exc:
-            logger.error("suggestions failed for '%s': %s", keyword, exc)
-            return []
 
     # ── Orchestration ─────────────────────────────────────────────────────────
 

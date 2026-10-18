@@ -41,7 +41,7 @@ def fake_region():
     )
 
 
-@pytest.mark.parametrize("freq", ["min", "h", "D", "W", "MS"])
+@pytest.mark.parametrize("freq", ["min", "8min", "h", "D", "W", "MS"])
 def test_full_pipeline_across_every_granularity(freq):
     """
     Every timeframe preset maps to one of these frequencies. The forecast
@@ -183,3 +183,41 @@ def test_fetch_all_returns_plain_cacheable_data(monkeypatch):
 
     result = analyzer.fetch_all(KEYWORDS[:1], timeframe="today 12-m", geo="")
     assert pickle.loads(pickle.dumps(result))["iot_df"].shape[0] == 60
+
+
+def _offline_analyzer(monkeypatch, pytrends):
+    monkeypatch.setattr("config.RETRY_DELAY", 0)
+    analyzer = TrendsAnalyzer.__new__(TrendsAnalyzer)
+    analyzer._last_request_time = 0.0
+    analyzer.pytrends = pytrends
+    monkeypatch.setattr(analyzer, "_rate_limit", lambda *a: None)
+    return analyzer
+
+
+def test_interest_over_time_retries_and_drops_partial_row(monkeypatch):
+    """A 429 on the data call is retried, and the unfinished period is removed."""
+    calls = []
+
+    class FakeTrends:
+        def interest_over_time(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("429")
+            return fake_iot(n=10, partial=True)
+
+    df = _offline_analyzer(monkeypatch, FakeTrends()).get_interest_over_time()
+    assert len(calls) == 2
+    assert len(df) == 9 and "isPartial" not in df.columns
+
+
+def test_optional_fetch_errors_become_warnings(monkeypatch):
+    """The real getters must raise, so fetch_all can tell the user."""
+    class FakeTrends:
+        def build_payload(self, *a, **k): pass
+        def interest_over_time(self): return fake_iot(n=10)
+        def interest_by_region(self, **k): raise RuntimeError("429")
+        def related_queries(self): raise RuntimeError("429")
+        def suggestions(self, keyword): raise RuntimeError("429")
+
+    result = _offline_analyzer(monkeypatch, FakeTrends()).fetch_all(KEYWORDS)
+    assert len(result["warnings"]) == 2

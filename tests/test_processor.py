@@ -29,6 +29,11 @@ class TestComputeGrowthRate:
     def test_constant_series_has_no_growth(self):
         assert DataProcessor.compute_growth_rate(series([50] * 10)) == 0.0
 
+    def test_zero_gap_keeps_real_elapsed_time(self):
+        """Regression: dropped zeros used to renumber x, so 10→20 over 9 weeks read as +100%/week."""
+        s = series([10] + [0] * 8 + [20])
+        assert DataProcessor.compute_growth_rate(s) == pytest.approx(8.0, abs=0.1)
+
     def test_steady_doubling_is_about_100_percent(self):
         s = series([1, 2, 4, 8, 16, 32, 64])
         assert DataProcessor.compute_growth_rate(s) == pytest.approx(100.0, abs=0.5)

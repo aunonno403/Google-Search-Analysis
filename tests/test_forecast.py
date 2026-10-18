@@ -16,6 +16,7 @@ def make_series(n=60, freq="W", start="2024-01-07"):
 class TestInferFreq:
     @pytest.mark.parametrize("freq,expected", [
         ("min", "min"),
+        ("8min", "8min"),
         ("h",   "h"),
         ("D",   "D"),
         ("W",   "W"),

@@ -46,13 +46,13 @@ class DataProcessor:
         values = pd.to_numeric(series, errors="coerce")
         # log() needs strictly positive input; 0-interest periods carry no
         # usable ratio information, so they are excluded from the fit.
-        positive = values[values > 0].dropna()
-        if len(positive) < 2:
+        mask = (values > 0).to_numpy()
+        if mask.sum() < 2:
             return 0.0
 
         # Fit against real elapsed position so gaps don't distort the slope.
-        x = np.arange(len(positive), dtype=float)
-        slope = np.polyfit(x, np.log(positive.to_numpy(dtype=float)), 1)[0]
+        x = np.flatnonzero(mask).astype(float)
+        slope = np.polyfit(x, np.log(values[mask].to_numpy(dtype=float)), 1)[0]
 
         rate = (np.exp(slope) - 1.0) * 100.0
         if not np.isfinite(rate):
